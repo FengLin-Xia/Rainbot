@@ -9,10 +9,9 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
-const (
-	retryMaxAttempts = 3
-	retryBaseDelay   = 500 * time.Millisecond
-)
+const retryMaxAttempts = 3
+
+var retryBaseDelay = 500 * time.Millisecond
 
 // isRetryable returns true for transient errors worth retrying.
 func isRetryable(err error) bool {
