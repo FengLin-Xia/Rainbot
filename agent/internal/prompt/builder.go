@@ -34,6 +34,23 @@ func (b *Builder) Build(history []llm.Message, userInput string) []llm.Message {
 	return msgs
 }
 
+// BuildWithSummary is like Build but prepends an earlier-context block to the
+// system prompt when summary is non-empty.
+func (b *Builder) BuildWithSummary(history []llm.Message, summary, userInput string) []llm.Message {
+	systemContent := b.systemPrompt
+	if summary != "" {
+		systemContent += "\n\n## Earlier conversation context\n" + summary
+	}
+	msgs := make([]llm.Message, 0, len(history)+2)
+	msgs = append(msgs, llm.Message{Role: llm.RoleSystem, Content: systemContent})
+	if len(history) > b.maxHistory {
+		history = history[len(history)-b.maxHistory:]
+	}
+	msgs = append(msgs, history...)
+	msgs = append(msgs, llm.Message{Role: llm.RoleUser, Content: userInput})
+	return msgs
+}
+
 // BuildStructureRequest asks the model to convert a raw answer into a
 // StructuredResponse JSON.
 func (b *Builder) BuildStructureRequest(rawAnswer string) []llm.Message {

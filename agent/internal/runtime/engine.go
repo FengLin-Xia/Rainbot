@@ -102,7 +102,7 @@ func (e *Engine) runTurn(
 	history := sess.history.All()
 	sess.mu.Unlock()
 
-	msgs := e.cfg.Prompt.Build(history, userInput)
+	msgs := e.cfg.Prompt.BuildWithSummary(history, sess.summary.Get(), userInput)
 	toolDefs := []llm.ToolDefinition{}
 	if e.cfg.Registry != nil {
 		toolDefs = e.cfg.Registry.Definitions()
@@ -272,6 +272,18 @@ func (e *Engine) runTurn(
 	sess.history.Append(llm.Message{Role: llm.RoleUser, Content: userInput})
 	sess.history.Append(llm.Message{Role: llm.RoleAssistant, Content: rawAnswer})
 	sess.mu.Unlock()
+
+	// Compress oldest messages into summary when short-term is >80% full.
+	maxSize := sess.history.MaxSize()
+	threshold := int(float64(maxSize) * 0.8)
+	drainCount := int(float64(maxSize) * 0.4)
+	if old := sess.history.DrainOldestIfAbove(threshold, drainCount); len(old) > 0 {
+		if err := sess.summary.Compress(ctx, old, e.cfg.LLM); err != nil {
+			obs.Warn(ctx, "summary_compress_failed", "error", err.Error())
+		} else {
+			obs.Info(ctx, "summary_compressed", "drained", len(old))
+		}
+	}
 
 	if output == "" {
 		output = rawAnswer
