@@ -104,7 +104,7 @@ func main() {
 	})
 
 	store := runtime.NewSessionStore()
-	handler := api.NewHandler(engine, store)
+	handler := api.NewHandler(engine, store, obs.DefaultMetricsStore())
 
 	// ── Start HTTP server ──────────────────────────────────────────────────
 	srv := &http.Server{

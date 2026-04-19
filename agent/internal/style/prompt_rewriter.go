@@ -68,6 +68,27 @@ func (p *PromptRewriter) Rewrite(ctx context.Context, req StyleRewriteRequest) (
 		}, nil
 	}
 
+	if len(req.MustKeep) > 0 {
+		var missing []string
+		for _, item := range req.MustKeep {
+			if !strings.Contains(output, item) {
+				missing = append(missing, item)
+			}
+		}
+		if len(missing) > 0 {
+			obs.Warn(ctx, "mustkeep_violation",
+				"missing_count", len(missing),
+				"items", strings.Join(missing, "|"),
+			)
+			return StyleRewriteResponse{
+				OutputText:       req.FinalAnswer,
+				Applied:          false,
+				FallbackReason:   "mustkeep_violation: " + strings.Join(missing, ", "),
+				ValidationPassed: false,
+			}, nil
+		}
+	}
+
 	return StyleRewriteResponse{
 		OutputText:       output,
 		Applied:          true,

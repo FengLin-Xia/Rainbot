@@ -17,22 +17,25 @@ const staticDir = "static"
 
 // Handler wires the HTTP API to the runtime engine.
 type Handler struct {
-	engine *runtime.Engine
-	store  *runtime.SessionStore
-	mux    *http.ServeMux
+	engine       *runtime.Engine
+	store        *runtime.SessionStore
+	metricsStore *obs.MetricsStore
+	mux          *http.ServeMux
 }
 
-func NewHandler(engine *runtime.Engine, store *runtime.SessionStore) *Handler {
+func NewHandler(engine *runtime.Engine, store *runtime.SessionStore, metricsStore *obs.MetricsStore) *Handler {
 	h := &Handler{
-		engine: engine,
-		store:  store,
-		mux:    http.NewServeMux(),
+		engine:       engine,
+		store:        store,
+		metricsStore: metricsStore,
+		mux:          http.NewServeMux(),
 	}
 	h.mux.HandleFunc("POST /sessions", h.createSession)
 	h.mux.HandleFunc("GET /sessions/{id}", h.getSession)
 	h.mux.HandleFunc("DELETE /sessions/{id}", h.deleteSession)
 	h.mux.HandleFunc("POST /sessions/{id}/turns", h.createTurn)
 	h.mux.HandleFunc("GET /health", h.health)
+	h.mux.HandleFunc("GET /metrics", h.metrics)
 	h.mux.Handle("GET /", http.FileServer(http.Dir(staticDir)))
 	return h
 }
@@ -168,6 +171,11 @@ func (h *Handler) collectBlocking(
 // GET /health
 func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// GET /metrics
+func (h *Handler) metrics(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, h.metricsStore.Recent(50))
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

@@ -178,8 +178,9 @@ func (e *Engine) runTurn(
 			break
 		}
 
-		// Execute tool calls.
+		// Execute tool calls concurrently.
 		toolUsed = true
+		var calls []tool.BatchCall
 		for idx := 0; idx < len(toolCallMap); idx++ {
 			tc := toolCallMap[idx]
 			if tc == nil {
@@ -190,27 +191,28 @@ func (e *Engine) runTurn(
 				Name:      tc.name,
 				Arguments: json.RawMessage(tc.argsBuf.String()),
 			})
+			calls = append(calls, tool.BatchCall{
+				CallID: tc.id,
+				Name:   tc.name,
+				Args:   json.RawMessage(tc.argsBuf.String()),
+			})
 		}
 		msgs = append(msgs, assistantMsg)
 
-		for idx := 0; idx < len(toolCallMap); idx++ {
-			tc := toolCallMap[idx]
-			if tc == nil {
-				continue
-			}
-			tracer.AddToolCall()
-			toolStart := time.Now()
-			result := e.cfg.Tools.Execute(ctx, tc.id, tc.name, json.RawMessage(tc.argsBuf.String()))
-			tracer.AddToolLatency(time.Since(toolStart))
+		toolStart := time.Now()
+		batchResults := e.cfg.Tools.ExecuteMany(ctx, calls)
+		tracer.AddToolLatency(time.Since(toolStart))
 
-			toolOutput := result.Output
-			if result.Err != nil {
-				toolOutput = fmt.Sprintf("error: %v", result.Err)
+		for _, r := range batchResults {
+			tracer.AddToolCall()
+			toolOutput := r.Output
+			if r.Err != nil {
+				toolOutput = fmt.Sprintf("error: %v", r.Err)
 			}
 			msgs = append(msgs, llm.Message{
 				Role:       llm.RoleTool,
-				ToolCallID: tc.id,
-				Name:       tc.name,
+				ToolCallID: r.ToolCallID,
+				Name:       r.ToolName,
 				Content:    toolOutput,
 			})
 		}
@@ -271,6 +273,11 @@ func (e *Engine) runTurn(
 	sess.history.Append(llm.Message{Role: llm.RoleAssistant, Content: rawAnswer})
 	sess.mu.Unlock()
 
+	if output == "" {
+		output = rawAnswer
+		obs.Warn(ctx, "output_empty_fallback")
+	}
+
 	obs.Info(ctx, "turn_done",
 		"style_applied", styleApplied,
 		"output_len", len(output),
@@ -304,6 +311,9 @@ func (e *Engine) structurize(ctx context.Context, rawAnswer string, toolUsed boo
 	var sr response.StructuredResponse
 	if err := json.Unmarshal([]byte(resp.Message.Content), &sr); err != nil {
 		return response.StructuredResponse{}, fmt.Errorf("structurize parse: %w", err)
+	}
+	if sr.FinalAnswer == "" {
+		sr.FinalAnswer = rawAnswer
 	}
 	sr.ToolUsed = sr.ToolUsed || toolUsed
 	return sr, nil

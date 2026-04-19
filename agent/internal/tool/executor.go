@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/xia-rain/go_agent/internal/obs"
@@ -29,6 +30,28 @@ type ExecuteResult struct {
 	Output     string
 	Err        error
 	LatencyMs  int64
+}
+
+// BatchCall describes a single tool invocation within a concurrent batch.
+type BatchCall struct {
+	CallID string
+	Name   string
+	Args   json.RawMessage
+}
+
+// ExecuteMany runs all calls concurrently and returns results in the same order.
+func (e *Executor) ExecuteMany(ctx context.Context, calls []BatchCall) []ExecuteResult {
+	results := make([]ExecuteResult, len(calls))
+	var wg sync.WaitGroup
+	for i, c := range calls {
+		wg.Add(1)
+		go func(idx int, bc BatchCall) {
+			defer wg.Done()
+			results[idx] = e.Execute(ctx, bc.CallID, bc.Name, bc.Args)
+		}(i, c)
+	}
+	wg.Wait()
+	return results
 }
 
 // Execute runs a single tool call identified by name and arguments.

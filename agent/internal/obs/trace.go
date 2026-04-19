@@ -77,5 +77,6 @@ func (t *Tracer) Finish(ctx context.Context) TurnMetrics {
 	t.metrics.TotalTurnLatencyMs = time.Since(t.turnStart).Milliseconds()
 	b, _ := json.Marshal(t.metrics)
 	Info(ctx, "turn_metrics", "metrics", string(b))
+	defaultStore.Push(t.metrics)
 	return t.metrics
 }
