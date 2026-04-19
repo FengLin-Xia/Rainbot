@@ -1,0 +1,35 @@
+server:
+  addr: ":8081"
+  read_timeout_s: 30
+  write_timeout_s: 120
+  idle_timeout_s: 60
+
+llm:
+  provider: openai_compat          # openai | openai_compat | ollama | anthropic
+  model: deepseek-chat
+  api_key: ""                    # set via GO_AGENT_LLM_API_KEY env var
+  base_url: "https://api.deepseek.com/v1"              # only for openai_compat / ollama
+  max_tokens: 4096
+  temperature: 0.7
+
+style:
+  enabled: false
+  backend: prompt_rewriter  # prompt_rewriter | local_model
+  # local model settings (used when backend = local_model)
+  local_base_url: "http://localhost:11434"
+  local_model: "llama3"
+
+tool:
+  timeout_s: 30
+  work_dir: ""   # working directory for shell_exec; empty = server's cwd
+  base_dir: ""   # restrict file_read to this directory tree; empty = unrestricted
+
+search:
+  api_key: ""    # Tavily API key; override with GO_AGENT_SEARCH_API_KEY env var
+  max_results: 5
+
+memory:
+  short_term_max: 50
+
+log:
+  level: debug              # debug | info | warn | error

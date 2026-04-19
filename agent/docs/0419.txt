@@ -1,0 +1,84 @@
+Go_Agent 项目现状与 Harness 框架差距分析
+日期：2026-04-19
+
+=== 当前状态 ===
+
+项目是一个结构清晰的 v0.1 runtime，核心链路已通：
+User → Session → Prompt → BigModel Stream → Agentic Loop → Structurize → Style → Output
+
+主要依赖：go-openai, uuid, yaml.v3（极简依赖树）
+入口：cmd/server/main.go，HTTP REST API，支持 SSE 流式输出
+
+已完成：
+- HTTP REST API（sessions, turns, SSE streaming）
+- 多 LLM provider 支持（OpenAI, Anthropic, Ollama, OpenAI-compat）
+- Agentic loop，最多 10 轮 tool call
+- Tool 系统：registry, executor, 超时控制，内置 shell_exec / file_read / web_search
+- StructuredResponse 中间层（FinalAnswer + KeyPoints + MustKeep + SceneType 等）
+- Style 层：profile 路由 + LLM rewrite + 本地模型后端
+- 短期对话记忆（FIFO 滚动窗口）
+- 结构化 JSON 日志（slog）+ 每轮指标采集（latency, token, fallback reason）
+- YAML 配置 + 环境变量覆盖
+
+=== 与 Harness 框架的差距 ===
+
+【高优先级 — 影响稳定性】
+
+1. Tool 顺序执行
+   文件：internal/tool/executor.go + internal/runtime/engine.go
+   问题：同一轮 LLM 返回多个 tool call 时逐个顺序执行
+   修复：用 goroutine + WaitGroup 并发跑，聚合结果
+
+2. Style MustKeep 无校验
+   文件：internal/style/prompt_rewriter.go
+   问题：MustKeep 字面量只传进 prompt，rewrite 后不验证
+   修复：rewrite 后做 strings.Contains 检查，失败则降级用原文
+
+3. Structurize 失败无降级
+   文件：internal/runtime/engine.go → structurize()
+   问题：JSON 解析失败返回空 StructuredResponse，FinalAnswer 为空
+   修复：解析失败时 FinalAnswer = rawText，保证答案不丢失
+
+4. 无重试机制
+   文件：internal/llm/openai.go
+   问题：LLM 瞬时错误、tool 超时直接报错，无 backoff 重试
+   修复：简单指数退避，最多 2 次重试
+
+【中优先级 — 影响生产可用性】
+
+5. 长期记忆是 stub
+   文件：internal/memory/summary.go
+   问题：SummaryMemory Get/Set 是空实现，没有压缩和召回逻辑
+
+6. 会话不持久化
+   文件：internal/runtime/session.go
+   问题：纯内存 map，重启即丢失所有 session
+
+7. Metrics 无导出
+   文件：internal/obs/trace.go
+   问题：TurnMetrics 只写 log，无 /metrics endpoint
+   修复：加 Prometheus expvar 或简单 JSON endpoint
+
+8. 动态 System Prompt
+   文件：internal/prompt/templates.go
+   问题：system prompt 是写死字符串，不随 scene/tools 变化
+
+【低优先级 — v0.2+ 范围】
+
+9. WebSocket 未实现（api/websocket.go 是注释 stub）
+10. 请求 schema 校验缺失
+11. 无限流/限速
+12. Multi-agent 编排（无 graph/DAG）
+13. Skill 系统（工具仅为原子 handler）
+14. Checkpoint/Resume
+
+=== 最小可用 Harness 补丁清单 ===
+
+优先做这 4 件，完成后可作为稳定 harness 运行：
+
+  [1] tool 并发执行        — executor.go，改造量小收益大
+  [2] MustKeep 字面校验   — prompt_rewriter.go，加 post-check
+  [3] structurize 降级    — engine.go，失败时 FinalAnswer=rawText
+  [4] /metrics endpoint   — obs/，暴露基本指标供监控
+
+其余为 v0.2+ 规划，不阻塞当前稳定运行。

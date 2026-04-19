@@ -1,0 +1,292 @@
+Go_Agent 技术补充方案 — Harness 最小补丁
+日期：2026-04-19
+基于：0419.txt 差距分析 + 源码审查
+
+本文档确定 4 个高优先级补丁的具体实现方向，可直接作为编码任务单。
+
+════════════════════════════════════════════════════════════
+PATCH-1：Tool 并发执行
+════════════════════════════════════════════════════════════
+
+问题定位
+  文件：internal/runtime/engine.go，第 196-216 行
+  当前：同一轮 LLM 返回多个 tool call 时，用 for idx 顺序调用
+        e.cfg.Tools.Execute()，每个 tool 都串行等待上一个完成。
+
+目标
+  同一轮的多个 tool call 并发执行，聚合后统一追加到 msgs。
+  工具间没有依赖关系，并发安全。
+
+方案
+
+  步骤 A：在 executor.go 新增批量执行方法
+  ─────────────────────────────────────────
+  // internal/tool/executor.go
+
+  type BatchCall struct {
+      CallID string
+      Name   string
+      Args   json.RawMessage
+  }
+
+  func (e *Executor) ExecuteMany(ctx context.Context, calls []BatchCall) []ExecuteResult {
+      results := make([]ExecuteResult, len(calls))
+      var wg sync.WaitGroup
+      for i, c := range calls {
+          wg.Add(1)
+          go func(idx int, bc BatchCall) {
+              defer wg.Done()
+              results[idx] = e.Execute(ctx, bc.CallID, bc.Name, bc.Args)
+          }(i, c)
+      }
+      wg.Wait()
+      return results
+  }
+
+  说明：results 按 calls 下标对齐，不需要互斥锁；
+        每个 goroutine 写自己的 results[idx]，无竞争。
+
+  步骤 B：engine.go 替换顺序 for 循环
+  ─────────────────────────────────────────
+  // 替换 engine.go 第 196-216 行的两个 for idx 循环
+
+  // 构建 BatchCall 列表（替换第一个 for idx）
+  var calls []tool.BatchCall
+  for idx := 0; idx < len(toolCallMap); idx++ {
+      tc := toolCallMap[idx]
+      if tc == nil { continue }
+      assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, llm.ToolCall{
+          ID:        tc.id,
+          Name:      tc.name,
+          Arguments: json.RawMessage(tc.argsBuf.String()),
+      })
+      calls = append(calls, tool.BatchCall{
+          CallID: tc.id,
+          Name:   tc.name,
+          Args:   json.RawMessage(tc.argsBuf.String()),
+      })
+  }
+  msgs = append(msgs, assistantMsg)
+
+  // 并发执行（替换第二个 for idx）
+  toolStart := time.Now()
+  batchResults := e.cfg.Tools.ExecuteMany(ctx, calls)
+  tracer.AddToolLatency(time.Since(toolStart))
+
+  for _, r := range batchResults {
+      tracer.AddToolCall()
+      toolOutput := r.Output
+      if r.Err != nil {
+          toolOutput = fmt.Sprintf("error: %v", r.Err)
+      }
+      msgs = append(msgs, llm.Message{
+          Role:       llm.RoleTool,
+          ToolCallID: r.ToolCallID,
+          Name:       r.ToolName,
+          Content:    toolOutput,
+      })
+  }
+
+  注意：AddToolLatency 改为记录整批耗时（并发后的 wall time），
+        AddToolCall 仍逐个计数。
+
+影响范围：executor.go（新增方法），engine.go（替换约 25 行）
+测试点：单 tool call 行为不变；多 tool call 并发结果顺序与 msgs 一致
+
+════════════════════════════════════════════════════════════
+PATCH-2：MustKeep 字面校验
+════════════════════════════════════════════════════════════
+
+问题定位
+  文件：internal/style/prompt_rewriter.go，第 71-77 行
+  当前：Rewrite 返回时硬编码 ValidationPassed: true，
+        不做任何实际检查；MustKeep 仅出现在 prompt 文本里。
+
+目标
+  rewrite 完成后，逐项检查 MustKeep 字面量是否存在于输出文本中。
+  任意一项缺失则降级回原文，记录具体违反项。
+
+方案
+
+  // 在 prompt_rewriter.go Rewrite 方法，output 赋值之后插入：
+
+  if len(req.MustKeep) > 0 {
+      var missing []string
+      for _, item := range req.MustKeep {
+          if !strings.Contains(output, item) {
+              missing = append(missing, item)
+          }
+      }
+      if len(missing) > 0 {
+          obs.Warn(ctx, "mustkeep_violation",
+              "missing_count", len(missing),
+              "items", strings.Join(missing, "|"),
+          )
+          return StyleRewriteResponse{
+              OutputText:       req.FinalAnswer,
+              Applied:          false,
+              FallbackReason:   "mustkeep_violation: " + strings.Join(missing, ", "),
+              ValidationPassed: false,
+          }, nil
+      }
+  }
+
+  // 正常返回时 ValidationPassed 改为真实含义：
+  return StyleRewriteResponse{
+      OutputText:       output,
+      Applied:          true,
+      AppliedProfile:   req.StyleProfile,
+      ValidationPassed: true,   // 此时已通过校验
+      Diagnostics:      map[string]string{"backend": "prompt_rewriter"},
+  }, nil
+
+  local_model.go 无需修改（复用同一 PromptRewriter，校验逻辑自动继承）。
+
+影响范围：prompt_rewriter.go（新增约 15 行）
+测试点：MustKeep 含数字/版本串时 rewrite 后验证失败走降级；
+        MustKeep 为空时走原有路径无性能损耗
+
+════════════════════════════════════════════════════════════
+PATCH-3：Structurize 降级补全
+════════════════════════════════════════════════════════════
+
+问题定位
+  文件：internal/runtime/engine.go，第 225-237 行
+  现状澄清：structurize 失败时 fallback 已设置 FinalAnswer=rawAnswer，
+            逻辑上是对的。
+  真正的问题：structurize 成功但 LLM 返回的 JSON 中 FinalAnswer 为空
+              时（模型省略字段），后续 style 层拿到空字符串继续处理，
+              最终输出为空。
+
+目标
+  structurize 成功解析后，若 FinalAnswer 为空则用 rawAnswer 填充，
+  保证 FinalAnswer 在进入 style 层前始终非空。
+
+方案
+
+  // structurize() 返回前，json.Unmarshal 之后加一行：
+
+  if sr.FinalAnswer == "" {
+      sr.FinalAnswer = rawAnswer
+  }
+  sr.ToolUsed = sr.ToolUsed || toolUsed
+  return sr, nil
+
+  同时在 engine.go runTurn 里，style 层执行完后加保险：
+
+  // 在最终 output 赋值后，上报 turn_done 之前：
+  if output == "" {
+      output = rawAnswer
+      obs.Warn(ctx, "output_empty_fallback")
+  }
+
+影响范围：engine.go（2 处各加 3 行）
+测试点：mock LLM 返回 {"scene_type":"chat"} 缺 final_answer 字段时，
+        output 等于 rawAnswer
+
+════════════════════════════════════════════════════════════
+PATCH-4：/metrics HTTP Endpoint
+════════════════════════════════════════════════════════════
+
+问题定位
+  文件：internal/obs/trace.go，api/http.go
+  当前：TurnMetrics 在 Finish() 里序列化后只写 slog，无法被外部采集。
+
+目标
+  暴露 GET /metrics 端点，返回最近若干轮的 metrics JSON 数组，
+  供监控/调试读取，不引入外部依赖。
+
+方案
+
+  步骤 A：新增 MetricsStore（internal/obs/store.go）
+  ─────────────────────────────────────────
+  package obs
+
+  import "sync"
+
+  // MetricsStore 保存最近 N 轮的 TurnMetrics，线程安全。
+  type MetricsStore struct {
+      mu      sync.RWMutex
+      ring    []TurnMetrics
+      maxSize int
+      head    int
+      count   int
+  }
+
+  func NewMetricsStore(maxSize int) *MetricsStore {
+      if maxSize <= 0 { maxSize = 200 }
+      return &MetricsStore{ring: make([]TurnMetrics, maxSize), maxSize: maxSize}
+  }
+
+  func (s *MetricsStore) Push(m TurnMetrics) {
+      s.mu.Lock()
+      defer s.mu.Unlock()
+      s.ring[s.head] = m
+      s.head = (s.head + 1) % s.maxSize
+      if s.count < s.maxSize { s.count++ }
+  }
+
+  func (s *MetricsStore) Recent(n int) []TurnMetrics {
+      s.mu.RLock()
+      defer s.mu.RUnlock()
+      if n <= 0 || n > s.count { n = s.count }
+      out := make([]TurnMetrics, n)
+      // 从最新往回读
+      for i := 0; i < n; i++ {
+          idx := ((s.head - 1 - i) + s.maxSize) % s.maxSize
+          out[i] = s.ring[idx]
+      }
+      return out
+  }
+
+  步骤 B：Tracer.Finish 同时写入 Store
+  ─────────────────────────────────────────
+  // trace.go 增加全局默认 store（或通过 Tracer 注入）
+  var defaultStore = NewMetricsStore(200)
+
+  func DefaultMetricsStore() *MetricsStore { return defaultStore }
+
+  // Finish 末尾追加：
+  defaultStore.Push(t.metrics)
+
+  步骤 C：api/http.go 注册端点
+  ─────────────────────────────────────────
+  // Server 结构体增加 store 字段，main.go 传入 obs.DefaultMetricsStore()
+
+  mux.HandleFunc("GET /metrics", s.handleMetrics)
+
+  func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+      n := 50 // 默认返回最近 50 条
+      recent := s.metricsStore.Recent(n)
+      w.Header().Set("Content-Type", "application/json")
+      json.NewEncoder(w).Encode(recent)
+  }
+
+  不引入 Prometheus，用 stdlib JSON 即可；后续要接 Prometheus 时
+  直接在此函数里换格式即可。
+
+影响范围：新增 obs/store.go，修改 trace.go（5 行）、api/http.go（10 行）、
+          cmd/server/main.go（传 store 参数）
+测试点：跑几轮 turn，GET /metrics 返回非空数组，字段正确
+
+════════════════════════════════════════════════════════════
+执行顺序建议
+════════════════════════════════════════════════════════════
+
+  1. PATCH-3（最小改动，2 行，消除潜在空输出）
+  2. PATCH-2（MustKeep 校验，保证 style 层诚实）
+  3. PATCH-1（并发工具，改动稍大，建议单独 PR）
+  4. PATCH-4（metrics endpoint，独立功能，不阻塞其他）
+
+每个 patch 独立可测、不互相依赖，可按顺序也可并行开发。
+
+════════════════════════════════════════════════════════════
+不在本批次内的事项（留 v0.2）
+════════════════════════════════════════════════════════════
+
+  - WebSocket 实现（api/websocket.go stub）
+  - SummaryMemory 压缩召回逻辑（memory/summary.go）
+  - 会话持久化（Redis/BoltDB 后端）
+  - LLM 调用重试 + 指数退避
+  - 动态 system prompt 组合
+  - Multi-agent 编排 / DAG 工作流

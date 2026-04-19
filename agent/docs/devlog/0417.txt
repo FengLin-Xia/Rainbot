@@ -1,0 +1,138 @@
+2026-04-17
+
+== 项目启动 ==
+
+从零搭建 Go Agent Runtime，对应方案文档：Go_Agent_Runtime_双模型风格层技术方案.md
+
+目标：稳定的 Go runtime + 受控风格后处理层，解决 OpenClaw 体感卡顿、链路不透明、风格靠 prompt 软约束容易漂移的问题。
+
+== 今日完成 ==
+
+- 初始化 Go module（github.com/xia-rain/go_agent，Go 1.22）
+- 依赖：go-openai v1.24、uuid v1.6、yaml.v3
+- 按方案目录结构搭全骨架，26 个文件
+
+分层实现情况：
+
+  obs/
+    logger.go     slog JSON 结构化日志，turn_id 自动注入
+    trace.go      TurnMetrics，记录 first_token / tool / style / total 延迟
+
+  llm/
+    client.go     ModelClient 接口，Message / ToolCall / StreamChunk 等核心类型
+    openai.go     OpenAI-compatible 实现，含流式 + tool call delta 拼装
+    ollama.go     复用 openai.go，指向本地 /v1 端点
+    anthropic.go  同上，指向 api.anthropic.com/v1
+
+  tool/
+    types.go      Handler 函数签名，Tool 结构体
+    registry.go   并发安全的工具注册表，输出 LLM 用的 ToolDefinition
+    executor.go   带超时的工具执行器，完整日志
+
+  response/
+    structured.go StructuredResponse 中间态，SceneType / RiskLevel / RewriteMode 枚举
+    formatter.go  fallback 文本格式化
+
+  style/
+    processor.go  StyleProcessor 接口 + StyleProfile 枚举（plain/blunt/sharp/mean-lite）
+    prompt_rewriter.go  默认后端，二次 LLM 调用改写风格
+    local_model.go      本地模型后端（Ollama / llama.cpp），复用 prompt_rewriter
+    router.go     ResolveProfile()，按 SceneType + RiskLevel 选档位
+
+  prompt/
+    templates.go  DefaultSystemPrompt + StructureSystemPrompt（JSON 提取用）
+    builder.go    Build()（agentic turn）+ BuildStructureRequest()（结构化提取）
+
+  memory/
+    short.go      ShortTermMemory，环形截断，保持 tool call / result 成对
+    summary.go    SummaryMemory stub，接口预留
+
+  runtime/
+    session.go    Session + SessionStore，并发安全
+    engine.go     核心 turn 循环：stream → tool loop → structurize → style → output
+    stream.go     SSE StreamWriter
+    metrics.go    TurnMetrics 类型别名（从 obs 导出给 api 层）
+
+  api/
+    http.go       POST /sessions, GET/DELETE /sessions/{id},
+                  POST /sessions/{id}/turns（SSE 流式 + 阻塞 JSON 两种模式）
+                  GET /health
+
+  cmd/server/main.go  配置加载、依赖注入、优雅关闭
+  configs/config.yaml
+
+== 关键设计决策 ==
+
+1. LLM 两次调用分工
+   第一次：流式 agentic loop，tool call 循环，结果直接推 SSE
+   第二次：非流式 JSONMode，把原始回答提炼为 StructuredResponse
+   理由：风格层不直接面对散文，避免改坏信息
+
+2. 风格层永远是 post-processor
+   不参与工具调用，不补充知识，只改句式/语气/节奏
+   失败时 fallback 到 StructuredResponse.FinalAnswer，主链路不受影响
+
+3. 风格路由
+   high risk → plain（强制）
+   chat/reflection/discussion → sharp
+   tutorial/coding → blunt
+   emotional/risky → plain
+   default → blunt
+
+4. 可观测性从第一天接入
+   每个 turn 记录：first_token_latency / tool_latency / style_latency / total_latency
+   fallback_reason 和 timeout_stage 显式字段，不靠"感觉"判断问题出在哪
+
+== 编译结果 ==
+
+go build ./... → 0 错误
+go vet ./...   → 0 警告
+
+== 遇到的问题 ==
+
+- go-openai v1.24 中 ToolCallDelta.Index 是 *int 而非 int，需要 nil 判断
+- go-openai 的 FunctionDefinition.Parameters 类型是 any，直接传 json.RawMessage 即可，不需要先 Unmarshal 成 openai.Definition（该类型不存在）
+- tool.Handler 签名用 json.RawMessage，executor 和 main 的调用点要对齐类型
+
+== 下一步 ==
+
+- 加真实工具：web search、shell exec、文件读写
+- 接 Ollama 本地模型跑风格层，对比 prompt_rewriter vs local_model 延迟
+- 补评测闭环：原始回答 vs 风格层输出，人工标注信息保真率
+- 考虑 session 持久化（目前纯内存）
+
+2026-04-17 变更记录
+
+## 新增真实工具实现
+
+internal/tool/shell.go
+- NewShellExecTool: 执行 bash -c 命令，stdout+stderr 合并返回
+- 非零退出码包含在输出里而非作为 error，让 agent 可读取失败信息
+- 支持 WorkDir 配置
+
+internal/tool/fileread.go
+- NewFileReadTool: 读取文件内容，64KB 截断并附说明
+- baseDir 参数可限制访问目录树，空字符串表示不限制
+
+internal/tool/search.go
+- NewWebSearchTool: 调用 Tavily API 搜索，返回摘要 + top N 结果
+- API key 无配置时返回明确错误，不在启动时 panic
+- 支持 MaxResults 配置
+
+cmd/server/main.go
+- registerBuiltinTools 改为接收 *Config，注册 shell_exec / file_read / web_search
+- Search API key 支持 GO_AGENT_SEARCH_API_KEY 环境变量覆盖
+- Config 新增 Tool.WorkDir、Tool.BaseDir、Search.APIKey、Search.MaxResults 字段
+- EngineConfig 传入 MaxTokens 和 Temperature（原来硬编码）
+
+configs/config.yaml
+- tool 段新增 work_dir、base_dir 字段
+- 新增 search 段（api_key、max_results）
+
+## Bug 修复
+
+internal/runtime/engine.go
+1. structurize + 第二次 LLM 调用在 StyleProcessor == nil 时不再执行，直接用 rawAnswer
+2. agentic loop 的 MaxTokens / Temperature 改为从 EngineConfig 读取，不再硬编码
+3. runTurn 新增 turnID 参数，TurnResult.TurnID 正确赋值（原来永远是空字符串）
+

@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Go Agent</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #f5f5f5;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  #app {
+    width: 100%;
+    max-width: 760px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: #fff;
+    box-shadow: 0 0 20px rgba(0,0,0,0.08);
+  }
+
+  header {
+    padding: 16px 20px;
+    border-bottom: 1px solid #eee;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  header h1 { font-size: 17px; font-weight: 600; color: #111; }
+
+  #status {
+    font-size: 12px;
+    color: #999;
+    margin-left: auto;
+  }
+
+  #status.ready { color: #22c55e; }
+  #status.error  { color: #ef4444; }
+
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .bubble-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+  }
+
+  .bubble-row.user  { flex-direction: row-reverse; }
+  .bubble-row.agent { flex-direction: row; }
+
+  .bubble {
+    max-width: 72%;
+    padding: 10px 14px;
+    border-radius: 16px;
+    font-size: 14px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .bubble-row.user  .bubble { background: #111; color: #fff; border-bottom-right-radius: 4px; }
+  .bubble-row.agent .bubble { background: #f0f0f0; color: #111; border-bottom-left-radius: 4px; }
+
+  .bubble.streaming::after {
+    content: "▋";
+    display: inline-block;
+    animation: blink 0.8s step-end infinite;
+  }
+
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .avatar {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    flex-shrink: 0;
+  }
+
+  .bubble-row.user  .avatar { background: #111; color: #fff; }
+  .bubble-row.agent .avatar { background: #e0e0e0; color: #555; }
+
+  #input-area {
+    padding: 14px 16px;
+    border-top: 1px solid #eee;
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+  }
+
+  #input {
+    flex: 1;
+    resize: none;
+    border: 1px solid #ddd;
+    border-radius: 12px;
+    padding: 10px 14px;
+    font-size: 14px;
+    font-family: inherit;
+    line-height: 1.5;
+    max-height: 140px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  #input:focus { border-color: #aaa; }
+  #input:disabled { background: #fafafa; }
+
+  #send-btn {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    border: none;
+    background: #111;
+    color: #fff;
+    font-size: 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: background 0.15s;
+  }
+
+  #send-btn:disabled { background: #ccc; cursor: default; }
+  #send-btn:not(:disabled):hover { background: #333; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>Go Agent</h1>
+    <span id="status">connecting...</span>
+  </header>
+  <div id="messages"></div>
+  <div id="input-area">
+    <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
+    <button id="send-btn" disabled>&#9650;</button>
+  </div>
+</div>
+
+<script>
+const messagesEl = document.getElementById('messages');
+const inputEl    = document.getElementById('input');
+const sendBtn    = document.getElementById('send-btn');
+const statusEl   = document.getElementById('status');
+
+let sessionId = null;
+let busy = false;
+
+async function init() {
+  try {
+    const res = await fetch('/sessions', { method: 'POST' });
+    const data = await res.json();
+    sessionId = data.session_id;
+    setStatus('ready', 'ready');
+    setInputEnabled(true);
+    inputEl.focus();
+  } catch (e) {
+    setStatus('error', 'connection failed');
+  }
+}
+
+function setStatus(cls, text) {
+  statusEl.className = cls;
+  statusEl.textContent = text;
+}
+
+function setInputEnabled(enabled) {
+  inputEl.disabled = !enabled;
+  sendBtn.disabled = !enabled;
+}
+
+function appendBubble(role, text) {
+  const row = document.createElement('div');
+  row.className = `bubble-row ${role}`;
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = role === 'user' ? 'U' : 'A';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.textContent = text;
+
+  row.appendChild(avatar);
+  row.appendChild(bubble);
+  messagesEl.appendChild(row);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return bubble;
+}
+
+async function send() {
+  const text = inputEl.value.trim();
+  if (!text || busy || !sessionId) return;
+
+  busy = true;
+  setInputEnabled(false);
+  inputEl.value = '';
+  inputEl.style.height = 'auto';
+
+  appendBubble('user', text);
+  const agentBubble = appendBubble('agent', '');
+  agentBubble.classList.add('streaming');
+
+  try {
+    const res = await fetch(`/sessions/${sessionId}/turns`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+      },
+      body: JSON.stringify({ message: text }),
+    });
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+
+      const lines = buf.split('\n');
+      buf = lines.pop(); // keep incomplete line
+
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') break;
+        agentBubble.textContent += payload;
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+    }
+  } catch (e) {
+    agentBubble.textContent = '[error: ' + e.message + ']';
+  } finally {
+    agentBubble.classList.remove('streaming');
+    busy = false;
+    setInputEnabled(true);
+    inputEl.focus();
+  }
+}
+
+inputEl.addEventListener('input', () => {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = inputEl.scrollHeight + 'px';
+});
+
+inputEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
+
+sendBtn.addEventListener('click', send);
+
+init();
+</script>
+</body>
+</html>
