@@ -12,8 +12,11 @@ import (
 	"github.com/xia-rain/go_agent/internal/runtime"
 )
 
-// staticDir is the path to the static assets directory, relative to the working directory.
-const staticDir = "static"
+const (
+	staticDir      = "static"
+	maxBodyBytes   = 64 * 1024       // 64 KB
+	maxMessageLen  = 32 * 1024       // 32 KB
+)
 
 // Handler wires the HTTP API to the runtime engine.
 type Handler struct {
@@ -54,6 +57,10 @@ func (h *Handler) createSession(w http.ResponseWriter, r *http.Request) {
 // GET /sessions/{id}
 func (h *Handler) getSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if _, err := uuid.Parse(id); err != nil {
+		http.Error(w, "invalid session id", http.StatusBadRequest)
+		return
+	}
 	sess, ok := h.store.Get(id)
 	if !ok {
 		http.Error(w, "session not found", http.StatusNotFound)
@@ -68,6 +75,10 @@ func (h *Handler) getSession(w http.ResponseWriter, r *http.Request) {
 // DELETE /sessions/{id}
 func (h *Handler) deleteSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if _, err := uuid.Parse(id); err != nil {
+		http.Error(w, "invalid session id", http.StatusBadRequest)
+		return
+	}
 	h.store.Delete(id)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -77,21 +88,37 @@ func (h *Handler) deleteSession(w http.ResponseWriter, r *http.Request) {
 // Streams response as SSE if Accept: text/event-stream, otherwise returns JSON.
 func (h *Handler) createTurn(w http.ResponseWriter, r *http.Request) {
 	sessID := r.PathValue("id")
+	if _, err := uuid.Parse(sessID); err != nil {
+		http.Error(w, "invalid session id", http.StatusBadRequest)
+		return
+	}
 	sess, ok := h.store.Get(sessID)
 	if !ok {
 		http.Error(w, "session not found", http.StatusNotFound)
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+
 	var body struct {
 		Message string `json:"message"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err.Error() == "http: request body too large" {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
-	if strings.TrimSpace(body.Message) == "" {
+
+	body.Message = strings.TrimSpace(body.Message)
+	if body.Message == "" {
 		http.Error(w, "message is required", http.StatusBadRequest)
+		return
+	}
+	if len(body.Message) > maxMessageLen {
+		http.Error(w, "message too long", http.StatusRequestEntityTooLarge)
 		return
 	}
 

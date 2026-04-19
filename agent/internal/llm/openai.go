@@ -38,6 +38,12 @@ func NewOpenAICompatClient(baseURL, apiKey, model string) *OpenAIClient {
 func (c *OpenAIClient) Name() string { return c.name }
 
 func (c *OpenAIClient) Generate(ctx context.Context, req GenerateRequest) (*GenerateResponse, error) {
+	return withRetry(ctx, func() (*GenerateResponse, error) {
+		return c.generate(ctx, req)
+	})
+}
+
+func (c *OpenAIClient) generate(ctx context.Context, req GenerateRequest) (*GenerateResponse, error) {
 	oaiReq := c.buildRequest(req)
 	oaiReq.Stream = false
 
@@ -73,6 +79,12 @@ func (c *OpenAIClient) Generate(ctx context.Context, req GenerateRequest) (*Gene
 }
 
 func (c *OpenAIClient) Stream(ctx context.Context, req GenerateRequest) (<-chan StreamChunk, error) {
+	return withRetry(ctx, func() (<-chan StreamChunk, error) {
+		return c.stream(ctx, req)
+	})
+}
+
+func (c *OpenAIClient) stream(ctx context.Context, req GenerateRequest) (<-chan StreamChunk, error) {
 	oaiReq := c.buildRequest(req)
 	oaiReq.Stream = true
 	oaiReq.StreamOptions = &openai.StreamOptions{IncludeUsage: true}
