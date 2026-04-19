@@ -57,17 +57,15 @@ func NewEngine(cfg EngineConfig) *Engine {
 	return &Engine{cfg: cfg}
 }
 
-// ProcessTurn runs a complete agent turn and streams incremental text chunks
-// to the returned channel.  The channel is closed when the turn is done.
-// TurnResult is sent as the final value before closing.
+// ProcessTurn runs a complete agent turn and streams typed events to the
+// returned channel.  The channel is closed after the final EventDone event.
 func (e *Engine) ProcessTurn(
 	ctx context.Context,
 	sess *Session,
 	userInput string,
 	turnID string,
-) (<-chan string, <-chan TurnResult, error) {
-	textCh := make(chan string, 32)
-	resultCh := make(chan TurnResult, 1)
+) (<-chan StreamEvent, error) {
+	eventCh := make(chan StreamEvent, 32)
 
 	ctx = obs.WithTurnID(ctx, turnID)
 	tracer := obs.NewTracer(turnID, e.cfg.LLM.Name())
@@ -75,19 +73,18 @@ func (e *Engine) ProcessTurn(
 	obs.Info(ctx, "turn_start", "session", sess.ID, "input_len", len(userInput))
 
 	go func() {
-		defer close(textCh)
-		defer close(resultCh)
+		defer close(eventCh)
 
-		result, err := e.runTurn(ctx, sess, userInput, turnID, tracer, textCh)
+		result, err := e.runTurn(ctx, sess, userInput, turnID, tracer, eventCh)
+		result.Metrics = tracer.Finish(ctx)
 		if err != nil {
 			obs.Error(ctx, "turn_error", "error", err.Error())
-			textCh <- fmt.Sprintf("[error: %v]", err)
+			eventCh <- StreamEvent{Type: EventError, ErrMsg: err.Error()}
 		}
-		result.Metrics = tracer.Finish(ctx)
-		resultCh <- result
+		eventCh <- StreamEvent{Type: EventDone, Result: &result}
 	}()
 
-	return textCh, resultCh, nil
+	return eventCh, nil
 }
 
 func (e *Engine) runTurn(
@@ -96,7 +93,7 @@ func (e *Engine) runTurn(
 	userInput string,
 	turnID string,
 	tracer *obs.Tracer,
-	textCh chan<- string,
+	eventCh chan<- StreamEvent,
 ) (TurnResult, error) {
 	sess.mu.Lock()
 	history := sess.history.All()
@@ -142,9 +139,8 @@ func (e *Engine) runTurn(
 					firstToken = true
 				}
 				contentBuf.WriteString(chunk.Delta)
-				// Forward incremental text to the caller.
 				select {
-				case textCh <- chunk.Delta:
+				case eventCh <- StreamEvent{Type: EventText, Text: chunk.Delta}:
 				case <-ctx.Done():
 					return TurnResult{}, ctx.Err()
 				}
@@ -199,6 +195,14 @@ func (e *Engine) runTurn(
 		}
 		msgs = append(msgs, assistantMsg)
 
+		for _, c := range calls {
+			select {
+			case eventCh <- StreamEvent{Type: EventToolStart, Tool: &ToolEvent{CallID: c.CallID, Name: c.Name}}:
+			case <-ctx.Done():
+				return TurnResult{}, ctx.Err()
+			}
+		}
+
 		toolStart := time.Now()
 		batchResults := e.cfg.Tools.ExecuteMany(ctx, calls)
 		tracer.AddToolLatency(time.Since(toolStart))
@@ -206,8 +210,16 @@ func (e *Engine) runTurn(
 		for _, r := range batchResults {
 			tracer.AddToolCall()
 			toolOutput := r.Output
+			te := &ToolEvent{CallID: r.ToolCallID, Name: r.ToolName, Output: toolOutput}
 			if r.Err != nil {
 				toolOutput = fmt.Sprintf("error: %v", r.Err)
+				te.Output = ""
+				te.Error = r.Err.Error()
+			}
+			select {
+			case eventCh <- StreamEvent{Type: EventToolDone, Tool: te}:
+			case <-ctx.Done():
+				return TurnResult{}, ctx.Err()
 			}
 			msgs = append(msgs, llm.Message{
 				Role:       llm.RoleTool,

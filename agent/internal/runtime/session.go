@@ -17,6 +17,7 @@ type Session struct {
 	mu      sync.Mutex
 	history *memory.ShortTermMemory
 	summary *memory.SummaryMemory
+	turnSem chan struct{} // capacity 1; serializes concurrent turns on this session
 }
 
 func NewSession(id string) *Session {
@@ -25,8 +26,23 @@ func NewSession(id string) *Session {
 		CreatedAt: time.Now(),
 		history:   memory.NewShortTerm(50),
 		summary:   memory.NewSummaryMemory(),
+		turnSem:   make(chan struct{}, 1),
 	}
 }
+
+// AcquireTurn tries to reserve the session for one turn.
+// Returns true if acquired; false if another turn is already in progress.
+func (s *Session) AcquireTurn() bool {
+	select {
+	case s.turnSem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// ReleaseTurn releases the turn lock.
+func (s *Session) ReleaseTurn() { <-s.turnSem }
 
 func (s *Session) AppendHistory(msg llm.Message)  { s.history.Append(msg) }
 func (s *Session) GetHistory() []llm.Message      { return s.history.All() }

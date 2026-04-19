@@ -1,9 +1,38 @@
 package runtime
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 )
+
+// EventType identifies the kind of StreamEvent.
+type EventType string
+
+const (
+	EventText      EventType = "text"
+	EventToolStart EventType = "tool_start"
+	EventToolDone  EventType = "tool_done"
+	EventDone      EventType = "done"
+	EventError     EventType = "error"
+)
+
+// ToolEvent carries tool call metadata for EventToolStart and EventToolDone.
+type ToolEvent struct {
+	CallID string `json:"call_id"`
+	Name   string `json:"name"`
+	Output string `json:"output,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// StreamEvent is the unified event type sent through the ProcessTurn channel.
+type StreamEvent struct {
+	Type   EventType   `json:"type"`
+	Text   string      `json:"text,omitempty"`
+	Tool   *ToolEvent  `json:"tool,omitempty"`
+	Result *TurnResult `json:"result,omitempty"`
+	ErrMsg string      `json:"error,omitempty"`
+}
 
 // StreamWriter writes SSE-formatted events to an http.ResponseWriter or
 // any io.Writer.
@@ -30,6 +59,16 @@ func (s *StreamWriter) WriteDone() error {
 // WriteError sends an error event.
 func (s *StreamWriter) WriteError(msg string) error {
 	_, err := fmt.Fprintf(s.w, "event: error\ndata: %s\n\n", escapeSSE(msg))
+	return err
+}
+
+// WriteEvent serializes a StreamEvent as a named SSE event.
+func (s *StreamWriter) WriteEvent(e StreamEvent) error {
+	data, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", e.Type, data)
 	return err
 }
 

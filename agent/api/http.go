@@ -98,6 +98,12 @@ func (h *Handler) createTurn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !sess.AcquireTurn() {
+		http.Error(w, "turn already in progress", http.StatusConflict)
+		return
+	}
+	defer sess.ReleaseTurn()
+
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 
 	var body struct {
@@ -127,7 +133,7 @@ func (h *Handler) createTurn(w http.ResponseWriter, r *http.Request) {
 
 	wantsSSE := strings.Contains(r.Header.Get("Accept"), "text/event-stream")
 
-	textCh, resultCh, err := h.engine.ProcessTurn(ctx, sess, body.Message, turnID)
+	eventCh, err := h.engine.ProcessTurn(ctx, sess, body.Message, turnID)
 	if err != nil {
 		obs.Error(ctx, "process_turn_error", "error", err.Error())
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -135,9 +141,9 @@ func (h *Handler) createTurn(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if wantsSSE {
-		h.streamSSE(w, r, sessID, turnID, textCh, resultCh)
+		h.streamSSE(w, r, sessID, turnID, eventCh)
 	} else {
-		h.collectBlocking(w, r, sessID, turnID, textCh, resultCh)
+		h.collectBlocking(w, r, sessID, turnID, eventCh)
 	}
 }
 
@@ -146,8 +152,7 @@ func (h *Handler) streamSSE(
 	r *http.Request,
 	sessID string,
 	turnID string,
-	textCh <-chan string,
-	resultCh <-chan runtime.TurnResult,
+	eventCh <-chan runtime.StreamEvent,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -157,23 +162,28 @@ func (h *Handler) streamSSE(
 	sw := runtime.NewStreamWriter(w)
 	flusher, canFlush := w.(http.Flusher)
 
-	for chunk := range textCh {
-		if err := sw.WriteText(chunk); err != nil {
-			return
-		}
+	flush := func() {
 		if canFlush {
 			flusher.Flush()
 		}
 	}
 
-	// Drain resultCh (metrics are already logged internally).
-	<-resultCh
-	h.store.Persist(sessID)
+	for event := range eventCh {
+		switch event.Type {
+		case runtime.EventText:
+			_ = sw.WriteText(event.Text)
+		case runtime.EventToolStart, runtime.EventToolDone:
+			_ = sw.WriteEvent(event)
+		case runtime.EventError:
+			_ = sw.WriteError(event.ErrMsg)
+		case runtime.EventDone:
+			h.store.Persist(sessID)
+		}
+		flush()
+	}
 
 	_ = sw.WriteDone()
-	if canFlush {
-		flusher.Flush()
-	}
+	flush()
 }
 
 func (h *Handler) collectBlocking(
@@ -181,15 +191,21 @@ func (h *Handler) collectBlocking(
 	_ *http.Request,
 	sessID string,
 	turnID string,
-	textCh <-chan string,
-	resultCh <-chan runtime.TurnResult,
+	eventCh <-chan runtime.StreamEvent,
 ) {
 	var sb strings.Builder
-	for chunk := range textCh {
-		sb.WriteString(chunk)
+	var result runtime.TurnResult
+	for event := range eventCh {
+		switch event.Type {
+		case runtime.EventText:
+			sb.WriteString(event.Text)
+		case runtime.EventDone:
+			if event.Result != nil {
+				result = *event.Result
+			}
+			h.store.Persist(sessID)
+		}
 	}
-	result := <-resultCh
-	h.store.Persist(sessID)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"turn_id":       turnID,

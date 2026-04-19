@@ -147,6 +147,40 @@ configs/config.yaml
   - Delete 后重载：session 不再存在
   - 内存模式不创建文件
 
+── Commit 6: Go 特性改进（并发 turn 竞争修复 + Tool 状态 SSE 流）────────────
+
+PATCH-6a 并发 turn 竞争修复
+  internal/runtime/session.go
+  - Session 新增 turnSem chan struct{}（容量 1），CSP 风格信号量
+  - AcquireTurn() bool：非阻塞 send，成功返回 true，已占用返回 false
+  - ReleaseTurn()：从 channel 读出令牌，释放锁
+
+  api/http.go
+  - createTurn：拿到 sess 后立即调用 AcquireTurn()
+    - 返回 false → HTTP 409 Conflict "turn already in progress"
+    - 成功 → defer ReleaseTurn()，确保 handler 返回时释放
+
+PATCH-6b Tool 状态 SSE 流
+  internal/runtime/stream.go
+  - 新增 EventType（text / tool_start / tool_done / done / error）
+  - 新增 ToolEvent{CallID, Name, Output, Error}
+  - 新增 StreamEvent{Type, Text, Tool, Result, ErrMsg}
+  - StreamWriter 新增 WriteEvent(StreamEvent)：按 event type 写命名 SSE 事件
+
+  internal/runtime/engine.go
+  - ProcessTurn 返回类型从 (<-chan string, <-chan TurnResult, error)
+    改为 (<-chan StreamEvent, error)
+  - runTurn 参数从 textCh chan<- string 改为 eventCh chan<- StreamEvent
+  - 文本 chunk → EventText；tool 调用前发 EventToolStart（每个 call 一条）
+  - ExecuteMany 完成后发 EventToolDone（含 output / error）
+  - goroutine 末尾发 EventError（如有）+ EventDone（含 TurnResult）
+
+  api/http.go
+  - streamSSE / collectBlocking 签名改为接受 <-chan StreamEvent
+  - streamSSE：EventText → WriteText；EventToolStart/Done → WriteEvent；
+    EventError → WriteError；EventDone → Persist
+  - collectBlocking：累积 EventText，EventDone 时取 TurnResult + Persist
+
 == 依赖变更 ==
 
   go.etcd.io/bbolt v1.4.3（session 持久化）
