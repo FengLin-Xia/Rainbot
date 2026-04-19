@@ -1,0 +1,165 @@
+2026-04-20
+
+== 今日目标 ==
+
+从差距分析出发，把 v0.1 runtime 推进到可以作为稳定 harness 运行的状态。
+参考文档：docs/0419.txt（差距分析）、docs/0419_tech_plan.txt（技术方案）
+
+== 完成的改动（按提交顺序）==
+
+── Commit 1: harness minimum patches ──────────────────────────────────────
+
+PATCH-1 Tool 并发执行
+  internal/tool/executor.go
+  - 新增 BatchCall 类型
+  - 新增 ExecuteMany()：goroutine + WaitGroup，同一轮的多个 tool call 并发跑
+  - 结果按输入下标对齐，无竞争
+
+  internal/runtime/engine.go
+  - agentic loop 里的顺序 for 循环替换为 ExecuteMany
+  - tool latency 改为记录整批 wall time
+
+PATCH-2 MustKeep 字面校验
+  internal/style/prompt_rewriter.go
+  - rewrite 完成后逐项 strings.Contains 检查 MustKeep 字面量
+  - 任意一项缺失：Applied=false，FallbackReason="mustkeep_violation: ..."，回退原文
+  - 修正 ValidationPassed 原来硬编码 true 的问题
+
+PATCH-3 Structurize 降级补全
+  internal/runtime/engine.go
+  - structurize() 里：JSON 解析成功但 FinalAnswer 为空时填充 rawAnswer
+  - runTurn() 末尾：output 为空时兜底赋值 rawAnswer 并打 warn 日志
+
+PATCH-4 /metrics HTTP Endpoint
+  internal/obs/store.go（新文件）
+  - MetricsStore：200 条环形 buffer，thread-safe，newest-first 读取
+
+  internal/obs/trace.go
+  - Finish() 末尾自动 push 到 defaultStore
+
+  api/http.go
+  - Handler 增加 metricsStore 字段
+  - 注册 GET /metrics，返回最近 50 条 TurnMetrics JSON
+
+  cmd/server/main.go
+  - NewHandler 传入 obs.DefaultMetricsStore()
+
+── Commit 2: LLM retry + API request validation ───────────────────────────
+
+LLM 重试（internal/llm/retry.go 新文件）
+  - withRetry[T] 泛型函数，最多 3 次，指数退避 500ms → 1s
+  - 重试条件：net.Error、HTTP 429、5xx；不重试：context 取消、4xx
+  - Generate 和 Stream 均接入（原始逻辑拆到私有方法）
+
+请求校验（api/http.go）
+  - POST body 限 64KB（MaxBytesReader），超出返回 413
+  - message 字段限 32KB，TrimSpace 后判空
+  - 所有带 session ID 的端点加 UUID 格式校验，非法返回 400
+
+── Commit 3: 测试覆盖 ──────────────────────────────────────────────────────
+
+新增 26 个测试，4 个包：
+
+  internal/llm/retry_test.go
+  - isRetryable：nil / context 错误 / net 错误 / 429+5xx / 4xx / 通用错误
+  - withRetry：首次成功 / 重试成功 / 耗尽次数 / 非可重试立即停止 / ctx 取消
+
+  internal/tool/executor_test.go
+  - 结果顺序与输入一致
+  - 3×50ms 工具并发完成时间 <120ms（验证真正并发）
+  - 未知工具名返回错误
+  - 空 batch 返回空 slice
+
+  internal/style/prompt_rewriter_test.go
+  - MustKeep 全部保留 → Applied=true
+  - MustKeep 违反 → 降级回原文
+  - MustKeep 为空 → 不触发校验
+  - LLM 报错 → 降级
+  - LLM 返回空白 → 降级
+
+  api/http_test.go
+  - 非法 UUID session ID → 400（GET/DELETE/POST turns 三个端点）
+  - 空 message / 纯空白 → 400
+  - message > 32KB → 413
+  - body > 64KB → 413
+  - health → 200
+  - createSession 返回合法 UUID
+  - getSession：存在 → 200，不存在 → 404
+
+── Commit 4: SummaryMemory（滚动摘要）──────────────────────────────────────
+
+internal/memory/summary.go（重写）
+  - SummaryMemory.Compress(ctx, msgs, client)：
+    调用 LLM 把一批消息压缩成 ≤150 词摘要
+    与已有 summary 合并成单一滚动段落
+    过滤 system / tool 消息，只压缩 user + assistant
+  - thread-safe（sync.RWMutex）
+
+internal/memory/short.go
+  - 新增 Len()、MaxSize()
+  - 新增 DrainOldestIfAbove(threshold, n)：
+    原子性检查阈值并 drain，rounded down to pairs，无竞争
+
+internal/prompt/builder.go
+  - 新增 BuildWithSummary(history, summary, userInput)：
+    summary 非空时追加到 system prompt 的 "## Earlier conversation context" 段
+
+internal/runtime/engine.go
+  - 用 BuildWithSummary 替换 Build
+  - turn 结束后：history > 80% maxSize 时 drain 最老 40%，调用 Compress
+  - 压缩失败打 warn，成功打 info，不影响主链路
+
+内存测试（internal/memory/summary_test.go）
+  - Compress 正常存储摘要
+  - 空消息列表不触发 LLM 调用
+  - LLM 报错时返回 error，summary 不变
+  - 过滤验证：system / tool 消息不出现在压缩输入里
+  - DrainOldestIfAbove：低于阈值返回 nil / 高于阈值正常 drain / 截断为对数
+
+── Commit 5: Session 持久化（BoltDB）──────────────────────────────────────
+
+internal/runtime/persist.go（新文件）
+  - BoltPersister：bbolt 单文件嵌入式 DB，无外部服务依赖
+  - sessionSnapshot：Session 的可序列化形式（id/created_at/history/summary）
+  - sessionToSnapshot / sessionFromSnapshot：内存 ↔ 存储互转
+
+internal/runtime/session.go
+  - SessionStore 增加可选 *BoltPersister 字段
+  - NewPersistentSessionStore(path)：打开/创建 DB，启动时加载所有已保存 session
+  - Create / Delete 写穿到 bolt（persister 非 nil 时）
+  - Persist(id)：手动持久化单个 session
+  - Close()：优雅关闭 bolt DB
+  - Session 新增 AppendHistory / GetHistory / GetSummary / SetSummary 访问方法
+
+api/http.go
+  - streamSSE / collectBlocking turn 完成后调用 store.Persist(sessID)
+
+cmd/server/main.go
+  - Config 新增 Storage.SessionDBPath 字段
+  - buildSessionStore()：path 为空用内存 store，有 path 用持久化 store
+  - 优雅关闭时调用 store.Close()
+
+configs/config.yaml
+  - 新增 storage.session_db_path（默认空 = 纯内存）
+
+持久化测试（internal/runtime/persist_test.go）
+  - session 写入后重启重载：history / summary 完整恢复
+  - Delete 后重载：session 不再存在
+  - 内存模式不创建文件
+
+== 依赖变更 ==
+
+  go.etcd.io/bbolt v1.4.3（session 持久化）
+  golang.org/x/sys v0.29.0（bbolt 间接依赖）
+  Go 1.22 → 1.23（bbolt 要求）
+
+== 当前测试状态 ==
+
+  go test ./... → 全部通过（29 个测试，5 个包有测试文件）
+
+== v0.2 遗留事项 ==
+
+  - WebSocket 实现（api/websocket.go stub）
+  - Multi-agent 编排 / DAG 工作流
+  - Prometheus/OTEL metrics 导出（当前只有 JSON endpoint）
+  - 动态 system prompt 组合
