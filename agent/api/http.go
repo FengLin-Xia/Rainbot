@@ -135,15 +135,16 @@ func (h *Handler) createTurn(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if wantsSSE {
-		h.streamSSE(w, r, turnID, textCh, resultCh)
+		h.streamSSE(w, r, sessID, turnID, textCh, resultCh)
 	} else {
-		h.collectBlocking(w, r, turnID, textCh, resultCh)
+		h.collectBlocking(w, r, sessID, turnID, textCh, resultCh)
 	}
 }
 
 func (h *Handler) streamSSE(
 	w http.ResponseWriter,
 	r *http.Request,
+	sessID string,
 	turnID string,
 	textCh <-chan string,
 	resultCh <-chan runtime.TurnResult,
@@ -167,6 +168,7 @@ func (h *Handler) streamSSE(
 
 	// Drain resultCh (metrics are already logged internally).
 	<-resultCh
+	h.store.Persist(sessID)
 
 	_ = sw.WriteDone()
 	if canFlush {
@@ -177,6 +179,7 @@ func (h *Handler) streamSSE(
 func (h *Handler) collectBlocking(
 	w http.ResponseWriter,
 	_ *http.Request,
+	sessID string,
 	turnID string,
 	textCh <-chan string,
 	resultCh <-chan runtime.TurnResult,
@@ -186,6 +189,7 @@ func (h *Handler) collectBlocking(
 		sb.WriteString(chunk)
 	}
 	result := <-resultCh
+	h.store.Persist(sessID)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"turn_id":       turnID,

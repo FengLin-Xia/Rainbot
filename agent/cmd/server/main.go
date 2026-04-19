@@ -55,6 +55,9 @@ type Config struct {
 	Memory struct {
 		ShortTermMax int `yaml:"short_term_max"`
 	} `yaml:"memory"`
+	Storage struct {
+		SessionDBPath string `yaml:"session_db_path"`
+	} `yaml:"storage"`
 }
 
 func main() {
@@ -103,7 +106,11 @@ func main() {
 		Temperature:    cfg.LLM.Temperature,
 	})
 
-	store := runtime.NewSessionStore()
+	store, err := buildSessionStore(ctx, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fatal: session store: %v\n", err)
+		os.Exit(1)
+	}
 	handler := api.NewHandler(engine, store, obs.DefaultMetricsStore())
 
 	// ── Start HTTP server ──────────────────────────────────────────────────
@@ -131,6 +138,20 @@ func main() {
 	shutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutCtx)
+	_ = store.Close()
+}
+
+func buildSessionStore(ctx context.Context, cfg *Config) (*runtime.SessionStore, error) {
+	if cfg.Storage.SessionDBPath == "" {
+		obs.Info(ctx, "session_store", "backend", "memory")
+		return runtime.NewSessionStore(), nil
+	}
+	store, err := runtime.NewPersistentSessionStore(cfg.Storage.SessionDBPath)
+	if err != nil {
+		return nil, err
+	}
+	obs.Info(ctx, "session_store", "backend", "bolt", "path", cfg.Storage.SessionDBPath)
+	return store, nil
 }
 
 func defaultConfig() *Config {

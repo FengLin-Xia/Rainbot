@@ -31,5 +31,8 @@ search:
 memory:
   short_term_max: 50
 
+storage:
+  session_db_path: ""   # empty = memory-only; set path (e.g. "data/sessions.db") to enable persistence
+
 log:
   level: debug              # debug | info | warn | error
