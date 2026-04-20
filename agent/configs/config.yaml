@@ -34,5 +34,8 @@ memory:
 storage:
   session_db_path: ""   # empty = memory-only; set path (e.g. "data/sessions.db") to enable persistence
 
+skills:
+  dir: "skills"   # path to ClawHub skill bundles directory (e.g. "skills"); empty = disabled
+
 log:
   level: debug              # debug | info | warn | error

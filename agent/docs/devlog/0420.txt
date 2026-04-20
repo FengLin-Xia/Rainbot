@@ -197,3 +197,41 @@ PATCH-6b Tool 状态 SSE 流
   - Multi-agent 编排 / DAG 工作流
   - Prometheus/OTEL metrics 导出（当前只有 JSON endpoint）
   - 动态 system prompt 组合
+
+── 补充：ClawHub Skill 集成 + 用户配置分层 ──────────────────────────────────
+
+PATCH-7 ClawHub Skill Loader
+  agent/internal/tool/skill_loader.go（新文件）
+  - LoadSkillsDir(ctx, dir)：扫描 skills/ 目录下的子目录
+  - 每个子目录查找 SKILL.md（支持大小写变体）
+  - parseSkillMD：分离 YAML frontmatter 与 markdown body
+  - 有 bins 字段 → 注册为可调用 Tool，handler 调对应 CLI（bash -c）
+  - 所有 skill → body 收集进 SkillPrompts 注入 system prompt
+  - 缺 binary / 缺 env var → warn 日志，不阻断启动
+  - BuildSkillSystemPrompt(base, prompts)：将 skill body 追加到 base system prompt
+
+  agent/cmd/server/main.go
+  - 启动时调 LoadSkillsDir，skill tools 注册进 registry
+  - system prompt 改为 BuildSkillSystemPrompt 构建，包含所有 skill body
+
+  agent/configs/config.yaml
+  - 新增 skills.dir 字段（默认 "skills"）
+
+  agent/skills/
+  - 新建目录，存放 ClawHub skill bundle，含 .gitkeep
+
+PATCH-8 用户配置分层（~/.config/go-agent/config.yaml）
+  agent/cmd/server/main.go
+  - loadUserConfig(ctx)：读取 ~/.config/go-agent/config.yaml，不存在则静默忽略
+  - mergeConfig(base, override)：非零字段覆盖，保证项目 config 不含敏感 key
+  - 加载顺序：项目 config → 用户 config → 环境变量
+
+PATCH-9 Makefile
+  agent/Makefile（新文件）
+  - make run / build / test / vet / clean
+  - make init-config：创建 ~/.config/go-agent/config.yaml 模板，一次性初始化
+
+文档更新
+  Go_Agent_Runtime_双模型风格层技术方案.md
+  - 新增 §17 ClawHub Skill 集成（格式说明、两类 skill 处理方式、目录结构、限制）
+  - 原 §17-§18 顺移为 §18-§19

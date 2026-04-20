@@ -625,7 +625,80 @@ agent/
 
 ---
 
-## 17. 最后结论
+## 17. ClawHub Skill 集成
+
+### 17.1 背景
+
+ClawHub 是 OpenClaw 生态的 skill 注册中心，skill 以目录形式发布，每个目录包含一个 `SKILL.md` 文件（YAML frontmatter + markdown body）及可选支撑文件。本项目通过 skill loader 实现与 ClawHub skill 格式的兼容，无需运行 OpenClaw 本体。
+
+### 17.2 Skill 文件格式
+
+```
+skills/
+└── todoist-cli/
+    ├── SKILL.md        # 必需
+    └── （可选）其他文本文件
+```
+
+`SKILL.md` 结构：
+
+```markdown
+---
+name: todoist-cli
+description: Manage Todoist tasks from the command line.
+version: 1.2.0
+metadata:
+  openclaw:
+    requires:
+      env: [TODOIST_API_KEY]
+      bins: [todoist-cli]
+    primaryEnv: TODOIST_API_KEY
+---
+# Todoist CLI Skill
+
+When the user asks to manage tasks, use the `todoist-cli` binary...
+（操作步骤、输入说明、错误处理等 runbook 内容）
+```
+
+### 17.3 两类 Skill 的处理方式
+
+| 类型 | 判断条件 | 处理方式 |
+|------|----------|----------|
+| 纯提示型 | `bins` 字段为空 | body 注入 system prompt |
+| CLI 工具型 | `bins` 字段有值 | 注册为 `Tool`（handler 调对应 CLI）+ body 注入 system prompt |
+
+两类 skill 都会将 body 注入 system prompt，确保 agent 知道该如何使用该能力。CLI 类 skill 额外注册成可调用工具，LLM 可通过 tool use 显式触发。
+
+### 17.4 实现位置
+
+```
+agent/
+├── skills/                          # ClawHub skill 目录，直接解压放这里
+│   └── <skill-name>/
+│       └── SKILL.md
+└── internal/tool/
+    └── skill_loader.go              # 扫描、解析、注册
+```
+
+核心函数：
+- `LoadSkillsDir(ctx, dir)` → `*SkillLoadResult`：扫描目录，返回工具列表和 prompt 列表
+- `BuildSkillSystemPrompt(base, prompts)` → `string`：将 skill body 追加到 base system prompt
+
+### 17.5 启动时行为
+
+- 扫描 `config.yaml` 里 `skills.dir` 指定的目录（空 = 禁用）
+- 缺失 CLI binary 或未设置 env var：打 warn 日志，**不阻止启动**
+- 注册成功的工具通过 `registry.Definitions()` 自动暴露给 LLM
+
+### 17.6 限制与边界
+
+- `install` 字段声明的依赖（brew/node/go 包）**不会自动安装**，需提前手动准备环境
+- 不兼容 OpenClaw 的 channel/session 机制，仅复用 skill 的 runbook 内容和 CLI 调用
+- skill body 会增加每轮 system prompt 长度，skill 数量多时注意 context 窗口压力
+
+---
+
+## 18. 最后结论
 
 这条路线是成立的，而且比“继续磨嘴臭 Prompt”更靠谱。
 
@@ -642,7 +715,7 @@ agent/
 
 ---
 
-## 18. 参考来源（用于项目调研）
+## 19. 参考来源（用于项目调研）
 
 - Routex GitHub: https://github.com/Ad3bay0c/routex
 - Routex doc / pkg.go.dev: https://pkg.go.dev/github.com/Ad3bay0c/routex/cmd/routex

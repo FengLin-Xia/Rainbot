@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -58,6 +59,9 @@ type Config struct {
 	Storage struct {
 		SessionDBPath string `yaml:"session_db_path"`
 	} `yaml:"storage"`
+	Skills struct {
+		Dir string `yaml:"dir"` // directory to scan for ClawHub skill bundles; empty = disabled
+	} `yaml:"skills"`
 }
 
 func main() {
@@ -69,7 +73,12 @@ func main() {
 		cfg = defaultConfig()
 	}
 
-	// Allow API key override via environment variable.
+	// User config (~/.config/go-agent/config.yaml) overrides project config.
+	if userCfg := loadUserConfig(ctx); userCfg != nil {
+		mergeConfig(cfg, userCfg)
+	}
+
+	// Environment variables override everything else.
 	if key := os.Getenv("GO_AGENT_LLM_API_KEY"); key != "" {
 		cfg.LLM.APIKey = key
 	}
@@ -82,9 +91,29 @@ func main() {
 	}
 	obs.Info(ctx, "llm_ready", "provider", bigModel.Name())
 
+	// ── Load ClawHub skills ────────────────────────────────────────────────
+	skillResult := &tool.SkillLoadResult{}
+	if cfg.Skills.Dir != "" {
+		var skillErr error
+		skillResult, skillErr = tool.LoadSkillsDir(ctx, cfg.Skills.Dir)
+		if skillErr != nil {
+			obs.Warn(ctx, "skills_load_failed", "error", skillErr.Error())
+			skillResult = &tool.SkillLoadResult{}
+		}
+		for _, w := range skillResult.Warnings {
+			obs.Warn(ctx, "skill_warning", "detail", w)
+		}
+		obs.Info(ctx, "skills_loaded", "tools", len(skillResult.Tools), "prompts", len(skillResult.SkillPrompts))
+	}
+
 	// ── Build tool registry & executor ────────────────────────────────────
 	registry := tool.NewRegistry()
 	registerBuiltinTools(registry, cfg)
+	for _, t := range skillResult.Tools {
+		if err := registry.Register(t); err != nil {
+			obs.Warn(ctx, "skill_tool_register_failed", "name", t.Name, "error", err.Error())
+		}
+	}
 	executor := tool.NewExecutor(registry, time.Duration(cfg.Tool.TimeoutS)*time.Second)
 
 	// ── Build style processor ──────────────────────────────────────────────
@@ -95,7 +124,8 @@ func main() {
 	}
 
 	// ── Build engine ───────────────────────────────────────────────────────
-	promptBuilder := prompt.New("", 0)
+	systemPrompt := tool.BuildSkillSystemPrompt(prompt.DefaultSystemPrompt, skillResult.SkillPrompts)
+	promptBuilder := prompt.New(systemPrompt, 0)
 	engine := runtime.NewEngine(runtime.EngineConfig{
 		LLM:            bigModel,
 		StyleProcessor: styleProc,
@@ -244,4 +274,67 @@ func registerBuiltinTools(r *tool.Registry, cfg *Config) {
 		APIKey:     searchAPIKey,
 		MaxResults: cfg.Search.MaxResults,
 	}))
+}
+
+// loadUserConfig reads ~/.config/go-agent/config.yaml and returns it, or nil
+// if the file doesn't exist (not an error — user config is always optional).
+func loadUserConfig(ctx context.Context) *Config {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	path := filepath.Join(home, ".config", "go-agent", "config.yaml")
+	cfg, err := loadConfig(path)
+	if err != nil {
+		return nil
+	}
+	obs.Info(ctx, "user_config_loaded", "path", path)
+	return cfg
+}
+
+// mergeConfig overlays non-zero fields from override onto base.
+// Intended for merging user credentials into project config.
+func mergeConfig(base, override *Config) {
+	if override.LLM.Provider != "" {
+		base.LLM.Provider = override.LLM.Provider
+	}
+	if override.LLM.Model != "" {
+		base.LLM.Model = override.LLM.Model
+	}
+	if override.LLM.APIKey != "" {
+		base.LLM.APIKey = override.LLM.APIKey
+	}
+	if override.LLM.BaseURL != "" {
+		base.LLM.BaseURL = override.LLM.BaseURL
+	}
+	if override.LLM.MaxTokens != 0 {
+		base.LLM.MaxTokens = override.LLM.MaxTokens
+	}
+	if override.LLM.Temperature != 0 {
+		base.LLM.Temperature = override.LLM.Temperature
+	}
+	if override.Search.APIKey != "" {
+		base.Search.APIKey = override.Search.APIKey
+	}
+	if override.Search.MaxResults != 0 {
+		base.Search.MaxResults = override.Search.MaxResults
+	}
+	if override.Server.Addr != "" {
+		base.Server.Addr = override.Server.Addr
+	}
+	if override.Storage.SessionDBPath != "" {
+		base.Storage.SessionDBPath = override.Storage.SessionDBPath
+	}
+	if override.Skills.Dir != "" {
+		base.Skills.Dir = override.Skills.Dir
+	}
+	if override.Style.Backend != "" {
+		base.Style.Backend = override.Style.Backend
+	}
+	if override.Style.LocalBaseURL != "" {
+		base.Style.LocalBaseURL = override.Style.LocalBaseURL
+	}
+	if override.Style.LocalModel != "" {
+		base.Style.LocalModel = override.Style.LocalModel
+	}
 }
