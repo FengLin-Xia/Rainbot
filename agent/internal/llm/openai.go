@@ -24,15 +24,11 @@ func NewOpenAIClient(apiKey, model string) *OpenAIClient {
 	}
 }
 
-// NewOpenAICompatClient creates a client for any OpenAI-compatible endpoint.
-func NewOpenAICompatClient(baseURL, apiKey, model string) *OpenAIClient {
-	cfg := openai.DefaultConfig(apiKey)
-	cfg.BaseURL = baseURL
-	return &OpenAIClient{
-		client: openai.NewClientWithConfig(cfg),
-		model:  model,
-		name:   "openai-compat/" + model,
-	}
+// NewOpenAICompatClient creates a raw-HTTP client for any OpenAI-compatible
+// endpoint.  It uses CompatClient instead of go-openai so that vendor
+// extensions such as DeepSeek's reasoning_content are preserved end-to-end.
+func NewOpenAICompatClient(baseURL, apiKey, model string) *CompatClient {
+	return NewCompatClient(baseURL, apiKey, model)
 }
 
 func (c *OpenAIClient) Name() string { return c.name }

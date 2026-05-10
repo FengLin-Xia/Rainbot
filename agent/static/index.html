@@ -75,6 +75,7 @@
 
   .bubble-row.user  .bubble { background: #111; color: #fff; border-bottom-right-radius: 4px; }
   .bubble-row.agent .bubble { background: #f0f0f0; color: #111; border-bottom-left-radius: 4px; }
+  .bubble-row.agent .bubble.error { background: #fff0f0; color: #cc0000; }
 
   .bubble.streaming::after {
     content: "▋";
@@ -97,6 +98,36 @@
 
   .bubble-row.user  .avatar { background: #111; color: #fff; }
   .bubble-row.agent .avatar { background: #e0e0e0; color: #555; }
+
+  /* tool call indicator */
+  .tool-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 0 0 36px; /* align with agent bubble */
+    font-size: 12px;
+    color: #888;
+  }
+
+  .tool-row .tool-icon {
+    font-size: 13px;
+  }
+
+  .tool-row.running .tool-name { color: #555; }
+  .tool-row.done    .tool-name { color: #22c55e; }
+  .tool-row.failed  .tool-name { color: #ef4444; }
+
+  .spinner {
+    width: 10px;
+    height: 10px;
+    border: 1.5px solid #ccc;
+    border-top-color: #555;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    flex-shrink: 0;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   #input-area {
     padding: 14px 16px;
@@ -164,6 +195,7 @@ const statusEl   = document.getElementById('status');
 
 let sessionId = null;
 let busy = false;
+const toolRows = {}; // callId → .tool-row element
 
 async function init() {
   try {
@@ -188,7 +220,7 @@ function setInputEnabled(enabled) {
   sendBtn.disabled = !enabled;
 }
 
-function appendBubble(role, text) {
+function appendBubble(role, text, extraClass) {
   const row = document.createElement('div');
   row.className = `bubble-row ${role}`;
 
@@ -197,7 +229,7 @@ function appendBubble(role, text) {
   avatar.textContent = role === 'user' ? 'U' : 'A';
 
   const bubble = document.createElement('div');
-  bubble.className = 'bubble';
+  bubble.className = 'bubble' + (extraClass ? ' ' + extraClass : '');
   bubble.textContent = text;
 
   row.appendChild(avatar);
@@ -205,6 +237,39 @@ function appendBubble(role, text) {
   messagesEl.appendChild(row);
   messagesEl.scrollTop = messagesEl.scrollHeight;
   return bubble;
+}
+
+function addToolRow(callId, name) {
+  const row = document.createElement('div');
+  row.className = 'tool-row running';
+
+  const spinner = document.createElement('div');
+  spinner.className = 'spinner';
+
+  const label = document.createElement('span');
+  label.className = 'tool-name';
+  label.textContent = name;
+
+  row.appendChild(spinner);
+  row.appendChild(label);
+  messagesEl.appendChild(row);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  toolRows[callId] = row;
+}
+
+function resolveToolRow(callId, success) {
+  const row = toolRows[callId];
+  if (!row) return;
+  row.className = 'tool-row ' + (success ? 'done' : 'failed');
+  // replace spinner with icon
+  const spinner = row.querySelector('.spinner');
+  if (spinner) {
+    const icon = document.createElement('span');
+    icon.className = 'tool-icon';
+    icon.textContent = success ? '✓' : '✗';
+    spinner.replaceWith(icon);
+  }
+  delete toolRows[callId];
 }
 
 async function send() {
@@ -234,26 +299,62 @@ async function send() {
     const decoder = new TextDecoder();
     let buf = '';
 
+    // per-event SSE state
+    let pendingEvent = 'message';
+    let pendingData  = '';
+
+    function dispatchEvent(eventType, data) {
+      if (data === '[DONE]') return; // terminal sentinel
+
+      if (eventType === 'message' || eventType === 'text') {
+        agentBubble.textContent += data;
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+
+      let parsed = null;
+      try { parsed = JSON.parse(data); } catch { /* plain string payload */ }
+
+      if (eventType === 'tool_start' && parsed?.tool) {
+        addToolRow(parsed.tool.call_id, parsed.tool.name);
+      } else if (eventType === 'tool_done' && parsed?.tool) {
+        resolveToolRow(parsed.tool.call_id, !parsed.tool.error);
+      } else if (eventType === 'error') {
+        agentBubble.textContent = (parsed && parsed.error) || data;
+        agentBubble.classList.add('error');
+      }
+    }
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
 
       const lines = buf.split('\n');
-      buf = lines.pop(); // keep incomplete line
+      buf = lines.pop(); // keep incomplete last line
 
       for (const line of lines) {
-        if (!line.startsWith('data:')) continue;
-        const payload = line.slice(5).trim();
-        if (payload === '[DONE]') break;
-        agentBubble.textContent += payload;
-        messagesEl.scrollTop = messagesEl.scrollHeight;
+        if (line === '') {
+          // blank line = end of event block, dispatch
+          if (pendingData !== '') {
+            dispatchEvent(pendingEvent, pendingData);
+          }
+          pendingEvent = 'message';
+          pendingData  = '';
+        } else if (line.startsWith('event:')) {
+          pendingEvent = line.slice(6).trim();
+        } else if (line.startsWith('data:')) {
+          pendingData += line.slice(5).trim();
+        }
       }
     }
   } catch (e) {
     agentBubble.textContent = '[error: ' + e.message + ']';
+    agentBubble.classList.add('error');
   } finally {
     agentBubble.classList.remove('streaming');
+    // clean up any stale tool indicators (e.g. on stream abort)
+    for (const id of Object.keys(toolRows)) resolveToolRow(id, false);
     busy = false;
     setInputEnabled(true);
     inputEl.focus();

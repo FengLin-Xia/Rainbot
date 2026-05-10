@@ -125,12 +125,16 @@ func (e *Engine) runTurn(
 		}
 
 		// Accumulate streaming chunks.
-		var contentBuf strings.Builder
+		var contentBuf, reasoningBuf strings.Builder
 		toolCallMap := map[int]*pendingToolCall{}
 
 		for chunk := range streamCh {
 			if chunk.Err != nil {
 				return TurnResult{}, fmt.Errorf("stream chunk: %w", chunk.Err)
+			}
+
+			if chunk.ReasoningDelta != "" {
+				reasoningBuf.WriteString(chunk.ReasoningDelta)
 			}
 
 			if chunk.Delta != "" {
@@ -163,8 +167,9 @@ func (e *Engine) runTurn(
 		}
 
 		assistantMsg := llm.Message{
-			Role:    llm.RoleAssistant,
-			Content: contentBuf.String(),
+			Role:             llm.RoleAssistant,
+			Content:          contentBuf.String(),
+			ReasoningContent: reasoningBuf.String(),
 		}
 
 		// No tool calls → we have the final answer.

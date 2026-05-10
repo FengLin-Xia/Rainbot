@@ -9,7 +9,7 @@ import (
 // Uses an OpenAI-compatible proxy layer or direct implementation.
 // For v0.1, we delegate to an OpenAI-compat wrapper around the Anthropic API.
 type AnthropicClient struct {
-	inner *OpenAIClient
+	inner *CompatClient
 }
 
 // NewAnthropicClient creates a client for the Anthropic API via its
@@ -18,7 +18,7 @@ func NewAnthropicClient(apiKey, model string) (*AnthropicClient, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("anthropic: api key is required")
 	}
-	inner := NewOpenAICompatClient("https://api.anthropic.com/v1", apiKey, model)
+	inner := NewCompatClient("https://api.anthropic.com/v1", apiKey, model)
 	inner.name = "anthropic/" + model
 	return &AnthropicClient{inner: inner}, nil
 }

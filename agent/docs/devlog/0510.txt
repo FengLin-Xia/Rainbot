@@ -1,0 +1,90 @@
+2026-05-10
+
+== 今日目标 ==
+
+切换主模型到 DeepSeek V4 Pro，修复 Chat UI 的 SSE 事件解析缺陷，
+并修复 DeepSeek V4 Pro thinking 模式引发的工具调用 400 错误。
+
+== 完成的改动 ==
+
+── PATCH-1: 模型切换 ────────────────────────────────────────────────────────
+
+  agent/configs/config.yaml
+  - llm.model: deepseek-chat → deepseek-v4-pro
+  - base_url / api_key 不变
+
+── PATCH-2: Chat UI SSE 多事件类型支持 ─────────────────────────────────────
+
+  agent/static/index.html（重写 SSE 解析与事件渲染）
+
+  问题：原 UI 只识别 data: 行，完全忽略 event: 字段，导致：
+    - tool_start / tool_done 事件被吞，工具调用对用户不可见
+    - event: error 无法识别，错误文本直接拼入消息气泡
+    - [DONE] 靠流关闭判断，不稳定
+
+  修复：
+  - SSE 解析改为标准双字段缓冲（pendingEvent + pendingData），
+    遇空行 dispatch，event: 行设置类型，data: 行填充 payload
+  - text / message 事件 → 文本追加到 agent bubble
+  - tool_start 事件 → 插入 .tool-row（spinner + 工具名）
+  - tool_done 事件 → spinner 替换为 ✓（成功）或 ✗（失败）
+  - error 事件 → 红色 .bubble.error，兼容纯字符串与 JSON payload
+  - [DONE] → early return，终止流
+  - finally 块清理所有未收到 tool_done 的悬挂 indicator（流中断容错）
+
+  样式新增：
+  - .tool-row.running / .done / .failed（含 spinner 动画）
+  - .bubble.error（红底红字）
+
+── PATCH-3: DeepSeek V4 Pro reasoning_content 透传 ─────────────────────────
+
+  背景：DeepSeek V4 Pro 默认开启 thinking 模式，响应里携带
+  reasoning_content 字段。下一轮请求必须把该字段原样回传，
+  否则 API 返回 400。go-openai v1.24 的 ChatCompletionMessage
+  有自定义 MarshalJSON，不支持扩展字段，无法注入 reasoning_content。
+
+  internal/llm/client.go
+  - Message 新增 ReasoningContent string（json:"reasoning_content,omitempty"）
+  - StreamChunk 新增 ReasoningDelta string
+
+  internal/llm/compat.go（新文件）
+  - CompatClient：纯 net/http 实现的 OpenAI-compat 客户端，替代 go-openai
+  - wire 类型 cMsg.Content 不加 omitempty（DeepSeek 要求 content 字段始终存在）
+  - generate()：响应解析提取 reasoning_content，存入 Message.ReasoningContent
+  - stream()：SSE 逐行解析，delta.reasoning_content → StreamChunk.ReasoningDelta
+    delta.content → StreamChunk.Delta，tool_calls → StreamChunk.ToolCallDelta
+  - 复用 withRetry 泛型重试逻辑
+  - NewCompatClient(baseURL, apiKey, model)
+
+  internal/llm/openai.go
+  - NewOpenAICompatClient 改为返回 *CompatClient（委托 NewCompatClient）
+
+  internal/llm/anthropic.go
+  - AnthropicClient.inner 字段类型 *OpenAIClient → *CompatClient
+
+  internal/llm/ollama.go
+  - NewOllamaClient 返回类型 *OpenAIClient → *CompatClient
+
+  internal/runtime/engine.go
+  - agentic loop 中新增 var reasoningBuf strings.Builder
+  - 累积 chunk.ReasoningDelta
+  - assistantMsg 新增 ReasoningContent: reasoningBuf.String()，
+    确保工具调用后的第二轮请求携带完整 reasoning_content
+
+== 验证 ==
+
+  go build ./... → 通过
+  go test ./...  → 全部通过（无新增测试，原有 10 个包全绿）
+
+  E2E smoke test（deepseek-v4-pro）：
+  - 纯文本问答：流式输出正常，first_token_latency ~3.2s
+  - 工具调用（shell_exec）：
+    · tool_start / tool_done SSE 事件正确发出
+    · reasoning_content 透传后 400 错误消失
+    · 模型自主发起两轮工具调用（当前目录 → 递归查找），最终输出正常
+
+== 遗留事项 ==
+
+  - WebSocket 实现（api/websocket.go stub）
+  - 评测闭环：raw vs styled 对比输出端点
+  - Metrics 可视化 Dashboard

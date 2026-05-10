@@ -15,11 +15,12 @@ const (
 
 // Message is a single entry in the conversation history.
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	Name       string     `json:"name,omitempty"`
+	Role             string     `json:"role"`
+	Content          string     `json:"content"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string     `json:"tool_call_id,omitempty"`
+	Name             string     `json:"name,omitempty"`
 }
 
 // ToolCall represents a function call requested by the model.
@@ -56,6 +57,8 @@ type GenerateResponse struct {
 type StreamChunk struct {
 	// Delta is incremental text content.
 	Delta string
+	// ReasoningDelta is incremental thinking/reasoning content (e.g. DeepSeek thinking mode).
+	ReasoningDelta string
 	// ToolCallDelta carries a partial tool call; accumulate by index.
 	ToolCallDelta *ToolCallDelta
 	FinishReason  string
