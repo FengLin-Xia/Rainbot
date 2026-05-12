@@ -7,7 +7,7 @@ server:
 llm:
   provider: openai_compat          # openai | openai_compat | ollama | anthropic
   model: deepseek-v4-pro
-  api_key: "sk-7c2e72c5eebe47538df1c1d058b574d8"                    # set via GO_AGENT_LLM_API_KEY env var
+  api_key: ""                    # set via GO_AGENT_LLM_API_KEY env var
   base_url: "https://api.deepseek.com/v1"              # only for openai_compat / ollama
   max_tokens: 4096
   temperature: 0.7
